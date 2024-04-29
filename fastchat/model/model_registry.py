@@ -184,6 +184,16 @@ register_model_info(
 )
 
 register_model_info(
+    [
+        "glm-4",
+    ],
+    "GLM-4",
+    "https://open.bigmodel.cn/api/paas/v4/",
+    "GLM-4 by ZhipuAI",
+)
+
+
+register_model_info(
     ["gpt-4-turbo-browsing"],
     "GPT-4-Turbo with browsing",
     "https://platform.openai.com/docs/assistants/overview",
