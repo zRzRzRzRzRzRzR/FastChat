@@ -9,6 +9,7 @@ import base64
 import dataclasses
 from enum import auto, IntEnum
 from io import BytesIO
+import os
 from typing import List, Any, Dict, Union, Tuple
 
 
@@ -68,6 +69,8 @@ class Conversation:
     stop_str: Union[str, List[str]] = None
     # Stops generation if meeting any token in this list
     stop_token_ids: List[int] = None
+    # The maximum image size in megabytes that this model takes in. None means we do not resize the image.
+    max_image_size_mb: int = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -311,6 +314,8 @@ class Conversation:
             ret = system_prompt + "\n"
             for role, message in self.messages:
                 if message:
+                    if type(message) is tuple:
+                        message, images = message
                     ret += role + ": " + message + "\n"
                 else:
                     ret += role + ":"
@@ -352,6 +357,7 @@ class Conversation:
         """Given an image, return the base64 encoded image string."""
         from PIL import Image
         import requests
+        from fastchat.utils import resize_image_and_return_image_in_bytes
 
         # Load image if it has not been loaded in yet
         if type(image) == str:
@@ -364,22 +370,10 @@ class Conversation:
             else:
                 image = Image.open(image).convert("RGB")
 
-        max_hw, min_hw = max(image.size), min(image.size)
-        aspect_ratio = max_hw / min_hw
-        max_len, min_len = 2048, 2048
-        shortest_edge = int(min(max_len / aspect_ratio, min_len, min_hw))
-        longest_edge = int(shortest_edge * aspect_ratio)
-        W, H = image.size
-        if longest_edge != max(image.size):
-            if H > W:
-                H, W = longest_edge, shortest_edge
-            else:
-                H, W = shortest_edge, longest_edge
-            image = image.resize((W, H))
-
-        buffered = BytesIO()
-        image.save(buffered, format="PNG")
-        img_b64_str = base64.b64encode(buffered.getvalue()).decode()
+        image_bytes = resize_image_and_return_image_in_bytes(
+            image, self.max_image_size_mb
+        )
+        img_b64_str = base64.b64encode(image_bytes.getvalue()).decode()
 
         return img_b64_str
 
@@ -391,12 +385,83 @@ class Conversation:
                 if type(msg) is tuple:
                     msg, image = msg
                     img_b64_str = image[0]  # Only one image on gradio at one time
-                    img_str = f'<img src="data:image/jpeg;base64,{img_b64_str}" alt="user upload image" />'
+                    if img_b64_str.startswith("http://") or img_b64_str.startswith(
+                        "https://"
+                    ):
+                        img_str = f'<img src="{img_b64_str}" alt="user upload image" />'
+                    else:
+                        img_str = f'<img src="data:image/png;base64,{img_b64_str}" alt="user upload image" />'
                     msg = img_str + msg.replace("<image>\n", "").strip()
 
                 ret.append([msg, None])
             else:
                 ret[-1][-1] = msg
+        return ret
+
+    def to_openai_image_format(self, image_urls):
+        import base64
+
+        openai_images = []
+        for image_url in image_urls:
+            if image_url.startswith("http://") or image_url.startswith(
+                "https://"
+            ):  # input is a url
+                openai_images.append(image_url)
+            elif image_url.lower().endswith(
+                ("png", "jpg", "jpeg", "webp", "gif")
+            ):  # input is a local image
+                img_b64_str = self.convert_image_to_base64(image_url)
+                filetype = image_url.split(".")[-1].lower()
+                openai_images.append(f"data:image/{filetype};base64,{img_b64_str}")
+            else:
+                try:
+                    assert (
+                        base64.b64encode(base64.b64decode(image_url))
+                        == image_url.encode()
+                    ), "The image data is not a valid base64 encoded string"
+                    openai_images.append(f"data:image/png;base64,{image_url}")
+                except:
+                    raise ValueError(
+                        f"This file is not valid or not currently supported by the OpenAI API: {image_url}"
+                    )
+        return openai_images
+
+    def to_openai_vision_api_messages(self):
+        """Convert the conversation to OpenAI vision api completion format"""
+        if self.system_message == "":
+            ret = []
+        else:
+            ret = [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": self.system_message}],
+                }
+            ]
+
+        for i, (_, msg) in enumerate(self.messages[self.offset :]):
+            if i % 2 == 0:
+                if type(msg) is tuple:
+                    content_list = [{"type": "text", "text": msg[0]}]
+
+                    image_urls = self.to_openai_image_format(msg[1])
+                    for image_url in image_urls:
+                        content_list.append(
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        )
+
+                    ret.append({"role": "user", "content": content_list})
+                else:
+                    ret.append(
+                        {"role": "user", "content": [{"type": "text", "text": msg}]}
+                    )
+            else:
+                if msg is not None:
+                    ret.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": msg}],
+                        }
+                    )
         return ret
 
     def to_openai_api_messages(self):
@@ -414,11 +479,187 @@ class Conversation:
                     ret.append({"role": "assistant", "content": msg})
         return ret
 
-    def extract_text_from_messages(self):
-        return [
-            (role, message[0]) if type(message) is tuple else (role, message)
-            for role, message in self.messages
+    def to_gemini_api_messages(self):
+        from fastchat.utils import load_image
+
+        if self.system_message == "":
+            ret = []
+        else:
+            ret = [{"role": "system", "content": self.system_message}]
+
+        for i, (_, msg) in enumerate(self.messages[self.offset :]):
+            if i % 2 == 0:
+                if type(msg) is tuple:
+                    text, images = msg[0], msg[1]
+                    content_list = [text]
+                    for image in images:
+                        pil_image = load_image(image)
+                        content_list.append(pil_image)
+                    ret.append({"role": "user", "content": content_list})
+                else:
+                    ret.append({"role": "user", "content": msg})
+            else:
+                if msg is not None:
+                    ret.append({"role": "model", "content": msg})
+        return ret
+
+    def to_vertex_api_messages(self):
+        from vertexai.preview.generative_models import Image
+        import base64
+        import requests
+
+        if self.system_message == "":
+            ret = []
+        else:
+            ret = [self.system_message]
+
+        for role, msg in self.messages[self.offset :]:
+            if msg is not None:
+                if type(msg) is tuple:
+                    text, images = msg[0], msg[1]
+                    for image in images:
+                        if image.startswith("http://") or image.startswith("https://"):
+                            response = requests.get(image)
+                            image = response.content
+                        else:  # base64
+                            image = base64.b64decode(image)
+                        ret.append(Image.from_bytes(image))
+                    ret.append(text)
+                else:
+                    ret.append(msg)
+
+        return ret
+
+    def to_anthropic_vision_api_messages(self):
+        """Convert the conversation to Claude-3 Messages Vision API format"""
+        ret = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": self.system_message}],
+            }
         ]
+        for i, (_, msg) in enumerate(self.messages[self.offset :]):
+            if i % 2 == 0:
+                if type(msg) is tuple:
+                    content_list = [{"type": "text", "text": msg[0]}]
+
+                    for image_url in msg[1]:
+                        # Claude only supports base64
+                        if image_url.startswith("http://") or image_url.startswith(
+                            "https://"
+                        ):
+                            image_url = self.convert_image_to_base64(image_url)
+
+                        content_list.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_url,
+                                },
+                            }
+                        )
+
+                    ret.append({"role": "user", "content": content_list})
+                else:
+                    ret.append(
+                        {"role": "user", "content": [{"type": "text", "text": msg}]}
+                    )
+            else:
+                if msg is not None:
+                    ret.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": msg}],
+                        }
+                    )
+        return ret
+
+    def to_reka_api_messages(self):
+        ret = []
+        for i, (_, msg) in enumerate(self.messages[self.offset :]):
+            if i % 2 == 0:
+                if type(msg) == tuple:
+                    text, images = msg
+                    for image in images:
+                        if image.startswith("https://") or image.startswith("http://"):
+                            ret.append(
+                                {"type": "human", "text": text, "media_url": image}
+                            )
+                        else:
+                            ret.append(
+                                {
+                                    "type": "human",
+                                    "text": text,
+                                    "media_url": f"data:image/png;base64,{image}",
+                                }
+                            )
+                else:
+                    ret.append({"type": "human", "text": msg})
+            else:
+                if msg is not None:
+                    ret.append({"type": "model", "text": msg})
+
+        return ret
+
+    def save_new_images(self, has_csam_images=False, use_remote_storage=False):
+        import hashlib
+        from fastchat.constants import LOGDIR
+        from fastchat.utils import load_image, upload_image_file_to_gcs
+
+        _, last_user_message = self.messages[-2]
+
+        if type(last_user_message) == tuple:
+            text, images = last_user_message[0], last_user_message[1]
+            loaded_images = [load_image(image) for image in images]
+            image_hashes = [
+                hashlib.md5(image.tobytes()).hexdigest() for image in loaded_images
+            ]
+
+            image_directory_name = "csam_images" if has_csam_images else "serve_images"
+            for i, (loaded_image, hash_str) in enumerate(
+                zip(loaded_images, image_hashes)
+            ):
+                filename = os.path.join(
+                    image_directory_name,
+                    f"{hash_str}.jpg",
+                )
+
+                if use_remote_storage and not has_csam_images:
+                    image_url = upload_image_file_to_gcs(loaded_image, filename)
+                    # NOTE(chris): If the URL were public, then we set it here so future model uses the link directly
+                    # images[i] = image_url
+                else:
+                    filename = os.path.join(LOGDIR, filename)
+                    if not os.path.isfile(filename):
+                        os.makedirs(os.path.dirname(filename), exist_ok=True)
+                        loaded_image.save(filename)
+
+    def extract_text_and_image_hashes_from_messages(self):
+        import hashlib
+        from fastchat.utils import load_image
+
+        messages = []
+
+        for role, message in self.messages:
+            if type(message) is tuple:
+                text, images = message[0], message[1]
+
+                image_hashes = []
+                for image in images:
+                    if image.startswith("http://") or image.startswith("https://"):
+                        image_hashes.append(image)
+                    else:
+                        image = load_image(image)
+                        image_hash = hashlib.md5(image.tobytes()).hexdigest()
+                        image_hashes.append(image_hash)
+
+                messages.append((role, (text, image_hashes)))
+            else:
+                messages.append((role, message))
+
+        return messages
 
     def copy(self):
         return Conversation(
@@ -433,6 +674,7 @@ class Conversation:
             sep2=self.sep2,
             stop_str=self.stop_str,
             stop_token_ids=self.stop_token_ids,
+            max_image_size_mb=self.max_image_size_mb,
         )
 
     def dict(self):
@@ -440,7 +682,7 @@ class Conversation:
             "template_name": self.name,
             "system_message": self.system_message,
             "roles": self.roles,
-            "messages": self.extract_text_from_messages(),
+            "messages": self.extract_text_and_image_hashes_from_messages(),
             "offset": self.offset,
         }
 
@@ -831,6 +1073,7 @@ register_conv_template(
         roles=("user", "assistant"),
         sep_style=SeparatorStyle.DEFAULT,
         sep=None,
+        max_image_size_mb=None,  # OpenAI does auto-resizing
     )
 )
 
@@ -868,6 +1111,7 @@ register_conv_template(
         roles=("Human", "Assistant"),
         sep_style=SeparatorStyle.ADD_COLON_SINGLE,
         sep="\n\n",
+        max_image_size_mb=5 / 1.35,
     )
 )
 
@@ -891,6 +1135,7 @@ register_conv_template(
         roles=("user", "assistant"),
         sep_style=SeparatorStyle.DEFAULT,
         sep=None,
+        max_image_size_mb=5 / 1.35,
     )
 )
 
@@ -914,6 +1159,7 @@ register_conv_template(
         roles=("user", "assistant"),
         sep_style=SeparatorStyle.DEFAULT,
         sep=None,
+        max_image_size_mb=5 / 1.35,
     )
 )
 
@@ -946,6 +1192,7 @@ register_conv_template(
         roles=("user", "assistant"),
         sep_style=SeparatorStyle.DEFAULT,
         sep=None,
+        max_image_size_mb=5 / 1.35,
     )
 )
 
@@ -1041,6 +1288,7 @@ register_conv_template(
         roles=("user", "model"),
         sep_style=SeparatorStyle.DEFAULT,
         sep=None,
+        max_image_size_mb=20,
     )
 )
 
@@ -1798,6 +2046,16 @@ register_conv_template(
         system_message="",
         roles=("user", "assistant"),
         sep_style=None,
+        sep=None,
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="reka",
+        system_message="",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.DEFAULT,
         sep=None,
     )
 )
